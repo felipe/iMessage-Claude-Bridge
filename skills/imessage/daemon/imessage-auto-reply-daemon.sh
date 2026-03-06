@@ -236,6 +236,8 @@ while true; do
 
                             # Only start agent if one isn't already running
                             if ! is_agent_running; then
+                                # Send thinking indicator before agent starts
+                                echo "..." | "$IMESSAGE_SKILL/send-message.sh" "$CONTACT_PHONE" > /dev/null 2>&1
                                 start_autonomous_agent "$current_text" "${current_chat:-$CONTACT_PHONE}"
                             else
                                 log "  Agent already running, skipping (agent will check for new messages)"
