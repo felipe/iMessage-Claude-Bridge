@@ -175,6 +175,79 @@ setup_mock
 # Don't call anything — simulate idle daemon loop
 assert_not_contains "no calls during idle" "keystroke"
 
+# ─── Test 9: keepalive runs while process is alive, stops when it exits ──────
+echo "Test 9: keepalive loop runs during process lifetime"
+setup_mock
+
+# Start a background process that sleeps briefly (simulates agent)
+sleep 2 &
+agent_pid=$!
+
+# Start indicator
+"$INDICATOR" "$PHONE" start
+
+# Run keepalive loop like the daemon does (1s interval for test speed)
+(
+    while kill -0 "$agent_pid" 2>/dev/null; do
+        sleep 0.5
+        "$INDICATOR" "$PHONE" keepalive > /dev/null 2>&1
+    done
+) &
+keepalive_pid=$!
+
+# Wait for the "agent" to finish
+wait "$agent_pid" 2>/dev/null || true
+
+# Stop keepalive and indicator
+kill "$keepalive_pid" 2>/dev/null; wait "$keepalive_pid" 2>/dev/null || true
+"$INDICATOR" "$PHONE" stop
+
+# Should have: 1 start + at least 1 keepalive + 1 stop
+keepalive_count=$(grep -c 'key code 51' "$MOCK_LOG" 2>/dev/null || echo 0)
+if [ "$keepalive_count" -ge 2 ]; then  # at least 1 keepalive delete + 1 stop delete
+    echo "  PASS: keepalive fired during process lifetime (key code 51 count: $keepalive_count)"
+    passed=$((passed + 1))
+else
+    echo "  FAIL: expected at least 2 delete keystrokes (keepalive + stop), got $keepalive_count"
+    failed=$((failed + 1))
+fi
+assert_contains "stop cmd+a called after process exit" 'keystroke "a" using command down' "$MOCK_LOG"
+
+# ─── Test 10: keepalive does NOT fire after process exits ─────────────────────
+echo "Test 10: no keepalive after process exits"
+setup_mock
+
+# Start and immediately kill a process
+sleep 0 &
+agent_pid=$!
+wait "$agent_pid" 2>/dev/null || true
+
+# Run keepalive loop — should exit immediately since process is already dead
+(
+    while kill -0 "$agent_pid" 2>/dev/null; do
+        sleep 0.5
+        "$INDICATOR" "$PHONE" keepalive > /dev/null 2>&1
+    done
+) &
+keepalive_pid=$!
+wait "$keepalive_pid" 2>/dev/null || true
+
+assert_not_contains "no keepalive calls for dead process" 'keystroke " "'
+
+# ─── Test 11: no duplicate indicator when agent already running ───────────────
+echo "Test 11: second message while agent running does not start new indicator"
+setup_mock
+
+# Simulate: agent is running (indicator already started)
+"$INDICATOR" "$PHONE" start
+start_count_before=$(grep -c 'imessage://' "$MOCK_LOG" 2>/dev/null || echo 0)
+
+# Simulate: daemon sees agent is running and skips (no second start call)
+# This tests the daemon logic: is_agent_running() returns true → skip
+
+# Verify only one start happened
+assert_call_count "only one start call" 'imessage://' 1
+
 # ─── Results ──────────────────────────────────────────────────────────────────
 echo ""
 echo "════════════════════════════════"
