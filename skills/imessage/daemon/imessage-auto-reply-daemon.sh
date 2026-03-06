@@ -177,9 +177,6 @@ IMPORTANT RULES:
 - Don't apologize excessively - be helpful and direct
 - If the request is dangerous or inappropriate, politely decline"
 
-    # Clear typing indicator before agent takes over
-    "$IMESSAGE_SKILL/typing-indicator.sh" "$CONTACT_PHONE" stop > /dev/null 2>&1
-
     # Start Claude Code agent
     log "  Launching Claude Code agent..."
     claude -p "$agent_prompt" $resume_flag --dangerously-skip-permissions > "$AGENT_LOG" 2>&1 &
@@ -188,8 +185,22 @@ IMPORTANT RULES:
 
     log "  Agent started with PID: $agent_pid"
 
+    # Keep typing indicator alive while agent works (~60s timeout on recipient side)
+    (
+        while kill -0 "$agent_pid" 2>/dev/null; do
+            sleep 30
+            "$IMESSAGE_SKILL/typing-indicator.sh" "$CONTACT_PHONE" keepalive > /dev/null 2>&1
+        done
+    ) &
+    local keepalive_pid=$!
+
     # Wait for agent to finish and capture conversation ID
     wait "$agent_pid" 2>/dev/null || true
+
+    # Stop keepalive loop and clear typing indicator
+    kill "$keepalive_pid" 2>/dev/null; wait "$keepalive_pid" 2>/dev/null || true
+    "$IMESSAGE_SKILL/typing-indicator.sh" "$CONTACT_PHONE" stop > /dev/null 2>&1
+    log "  Typing indicator cleared"
 
     # Try to extract conversation ID from agent output for future resumes
     local new_conv_id=$(grep -o 'conversation_id: [a-zA-Z0-9_-]*' "$AGENT_LOG" 2>/dev/null | tail -1 | awk '{print $2}')
