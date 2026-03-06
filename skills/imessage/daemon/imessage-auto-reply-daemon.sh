@@ -189,7 +189,7 @@ IMPORTANT RULES:
     (
         while kill -0 "$agent_pid" 2>/dev/null; do
             sleep 30
-            "$IMESSAGE_SKILL/typing-indicator.sh" "$CONTACT_PHONE" keepalive > /dev/null 2>&1
+            "$IMESSAGE_SKILL/typing-indicator.sh" "$CONTACT_PHONE" keepalive > /dev/null 2>&1 || true
         done
     ) &
     local keepalive_pid=$!
@@ -199,7 +199,7 @@ IMPORTANT RULES:
 
     # Stop keepalive loop and clear typing indicator
     kill "$keepalive_pid" 2>/dev/null; wait "$keepalive_pid" 2>/dev/null || true
-    "$IMESSAGE_SKILL/typing-indicator.sh" "$CONTACT_PHONE" stop > /dev/null 2>&1
+    "$IMESSAGE_SKILL/typing-indicator.sh" "$CONTACT_PHONE" stop > /dev/null 2>&1 || true
     log "  Typing indicator cleared"
 
     # Try to extract conversation ID from agent output for future resumes
@@ -250,8 +250,8 @@ while true; do
 
                             # Only start agent if one isn't already running
                             if ! is_agent_running; then
-                                # Trigger native typing indicator
-                                "$IMESSAGE_SKILL/typing-indicator.sh" "$CONTACT_PHONE" start > /dev/null 2>&1
+                                # Trigger native typing indicator (best-effort, don't crash daemon)
+                                "$IMESSAGE_SKILL/typing-indicator.sh" "$CONTACT_PHONE" start > /dev/null 2>&1 || log "  Typing indicator failed, continuing"
                                 start_autonomous_agent "$current_text" "${current_chat:-$CONTACT_PHONE}"
                             else
                                 log "  Agent already running, skipping (agent will check for new messages)"
