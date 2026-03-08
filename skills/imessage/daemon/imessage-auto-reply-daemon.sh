@@ -28,6 +28,7 @@ CONTACT_EMAIL="${IMESSAGE_CONTACT_EMAIL:-}"
 CONTACT_PHONE="${IMESSAGE_CONTACT_PHONE:?Error: IMESSAGE_CONTACT_PHONE environment variable is required}"
 CONTACT_NAME="${IMESSAGE_CONTACT_NAME:?Error: IMESSAGE_CONTACT_NAME environment variable is required}"
 CHECK_INTERVAL="${IMESSAGE_CHECK_INTERVAL:-1}"
+DEBOUNCE_SECONDS="${IMESSAGE_DEBOUNCE:-3}"
 
 # Load environment variables if .env exists
 if [ -f "$PROJECT_ROOT/.env" ]; then
@@ -247,17 +248,17 @@ IMPORTANT RULES:
 - When you see ￼ (object replacement character) in message text, it means there's an attachment — check for ATTACHMENT lines in the message data and use Read to view image files
 - Expand ~ to \$HOME in attachment paths before reading them"
 
-    # Start Claude Code agent
-    log "  Launching Claude Code agent (thread: $thread_id)..."
-    claude -p "$agent_prompt" $resume_flag --dangerously-skip-permissions > "$agent_log" 2>&1 &
-    local agent_pid=$!
-    echo "$agent_pid" > "$pid_file"
-
-    log "  Agent started with PID: $agent_pid (thread: $thread_id)"
-
-    # Run the wait/cleanup in a background subshell so the main loop can continue
+    # Run the agent and cleanup in a background subshell so the main loop can continue
     # processing messages for other threads concurrently
+    log "  Launching Claude Code agent (thread: $thread_id)..."
     (
+        # Start Claude Code agent inside the subshell so we can wait on it
+        claude -p "$agent_prompt" $resume_flag --dangerously-skip-permissions > "$agent_log" 2>&1 &
+        local agent_pid=$!
+        echo "$agent_pid" > "$pid_file"
+
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')]   Agent started with PID: $agent_pid (thread: $thread_id)" >> "$LOG_FILE"
+
         # Keep typing indicator alive while agent works (~60s timeout on recipient side)
         (
             while kill -0 "$agent_pid" 2>/dev/null; do
@@ -267,32 +268,25 @@ IMPORTANT RULES:
         ) &
         local keepalive_pid=$!
 
-        # Wait for agent to finish and capture conversation ID
+        # Wait for agent to finish
         wait "$agent_pid" 2>/dev/null || true
 
         # Stop keepalive loop and clear typing indicator
         kill "$keepalive_pid" 2>/dev/null; wait "$keepalive_pid" 2>/dev/null || true
         "$IMESSAGE_SKILL/typing-indicator.sh" "$CONTACT_PHONE" stop > /dev/null 2>&1 || true
 
-        # Log completion
-        local completion_msg="[$(date '+%Y-%m-%d %H:%M:%S')]   Typing indicator cleared (thread: $thread_id)"
-        echo "$completion_msg"
-        echo "$completion_msg" >> "$LOG_FILE"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')]   Typing indicator cleared (thread: $thread_id)" >> "$LOG_FILE"
 
         # Try to extract conversation ID from agent output for future resumes
         local new_conv_id=$(grep -o 'conversation_id: [a-zA-Z0-9_-]*' "$agent_log" 2>/dev/null | tail -1 | awk '{print $2}')
         if [ -n "$new_conv_id" ]; then
             echo "$new_conv_id" > "$conversation_id_file"
-            local conv_msg="[$(date '+%Y-%m-%d %H:%M:%S')]   Saved conversation ID: $new_conv_id (thread: $thread_id)"
-            echo "$conv_msg"
-            echo "$conv_msg" >> "$LOG_FILE"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')]   Saved conversation ID: $new_conv_id (thread: $thread_id)" >> "$LOG_FILE"
         fi
 
         # Clean up PID file
         rm -f "$pid_file"
-        local done_msg="[$(date '+%Y-%m-%d %H:%M:%S')]   Agent session completed (thread: $thread_id)"
-        echo "$done_msg"
-        echo "$done_msg" >> "$LOG_FILE"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')]   Agent session completed (thread: $thread_id)" >> "$LOG_FILE"
     ) &
 }
 
@@ -311,61 +305,137 @@ while true; do
     new_messages=$("$IMESSAGE_SKILL/check-new-messages-db.sh" "$CONTACT_PHONE" 2>/dev/null)
 
     if [ -n "$new_messages" ]; then
-        # Parse messages
+        # Parse and collect unprocessed messages
+        # Each entry: thread_id|chat|text
+        collected=()
         while IFS= read -r line; do
             case "$line" in
-                "MSG_ID: "*)
-                    current_msg_id="${line#MSG_ID: }"
-                    ;;
-                "GUID: "*)
-                    current_guid="${line#GUID: }"
-                    ;;
-                "TEXT: "*)
-                    current_text="${line#TEXT: }"
-                    ;;
-                "THREAD_REPLY_TO: "*)
-                    current_thread_reply_to="${line#THREAD_REPLY_TO: }"
-                    ;;
-                "CHAT: "*)
-                    current_chat="${line#CHAT: }"
-                    ;;
+                "MSG_ID: "*) current_msg_id="${line#MSG_ID: }" ;;
+                "GUID: "*) current_guid="${line#GUID: }" ;;
+                "TEXT: "*) current_text="${line#TEXT: }" ;;
+                "THREAD_REPLY_TO: "*) current_thread_reply_to="${line#THREAD_REPLY_TO: }" ;;
+                "CHAT: "*) current_chat="${line#CHAT: }" ;;
                 "---")
-                    # Process this message
                     if [ -n "$current_msg_id" ] && [ -n "$current_text" ]; then
                         if ! check_if_processed "$current_msg_id"; then
-                            # Determine thread ID:
-                            # - If it's a reply, use the thread_originator_guid
-                            # - If it's a new message with a GUID, use its own GUID (starts a new thread)
-                            # - Otherwise fall back to "default" for backward compatibility
                             thread_id="default"
                             if [ -n "$current_thread_reply_to" ]; then
                                 thread_id="$current_thread_reply_to"
                             elif [ -n "$current_guid" ]; then
                                 thread_id="$current_guid"
                             fi
-
                             log "New message (thread: $thread_id): \"$current_text\""
                             mark_as_processed "$current_msg_id"
-
-                            # Only start agent if one isn't already running for THIS thread
-                            if ! is_agent_running "$thread_id"; then
-                                # Trigger native typing indicator (best-effort, don't crash daemon)
-                                "$IMESSAGE_SKILL/typing-indicator.sh" "$CONTACT_PHONE" start > /dev/null 2>&1 || log "  Typing indicator failed, continuing"
-                                start_autonomous_agent "$current_text" "${current_chat:-$CONTACT_PHONE}" "$thread_id"
-                            else
-                                log "  Agent already running for thread $thread_id, skipping (agent will check for new messages)"
-                            fi
+                            collected+=("${thread_id}|${current_chat:-$CONTACT_PHONE}|${current_text}")
                         fi
                     fi
-                    # Reset for next message
-                    current_msg_id=""
-                    current_guid=""
-                    current_text=""
-                    current_thread_reply_to=""
-                    current_chat=""
+                    current_msg_id=""; current_guid=""; current_text=""; current_thread_reply_to=""; current_chat=""
                     ;;
             esac
         done <<< "$new_messages"
+
+        # If we collected new messages, debounce to catch rapid follow-ups
+        if [ ${#collected[@]} -gt 0 ]; then
+            log "Debouncing ${DEBOUNCE_SECONDS}s..."
+            sleep "$DEBOUNCE_SECONDS"
+
+            # Check for more messages that arrived during debounce
+            more_messages=$("$IMESSAGE_SKILL/check-new-messages-db.sh" "$CONTACT_PHONE" 2>/dev/null)
+            if [ -n "$more_messages" ]; then
+                while IFS= read -r line; do
+                    case "$line" in
+                        "MSG_ID: "*) current_msg_id="${line#MSG_ID: }" ;;
+                        "GUID: "*) current_guid="${line#GUID: }" ;;
+                        "TEXT: "*) current_text="${line#TEXT: }" ;;
+                        "THREAD_REPLY_TO: "*) current_thread_reply_to="${line#THREAD_REPLY_TO: }" ;;
+                        "CHAT: "*) current_chat="${line#CHAT: }" ;;
+                        "---")
+                            if [ -n "$current_msg_id" ] && [ -n "$current_text" ]; then
+                                if ! check_if_processed "$current_msg_id"; then
+                                    thread_id="default"
+                                    if [ -n "$current_thread_reply_to" ]; then
+                                        thread_id="$current_thread_reply_to"
+                                    elif [ -n "$current_guid" ]; then
+                                        thread_id="$current_guid"
+                                    fi
+                                    log "Additional message during debounce (thread: $thread_id): \"$current_text\""
+                                    mark_as_processed "$current_msg_id"
+                                    collected+=("${thread_id}|${current_chat:-$CONTACT_PHONE}|${current_text}")
+                                fi
+                            fi
+                            current_msg_id=""; current_guid=""; current_text=""; current_thread_reply_to=""; current_chat=""
+                            ;;
+                    esac
+                done <<< "$more_messages"
+            fi
+
+            # Group collected messages by thread and launch agents
+            # For non-reply messages (unique GUIDs), merge them under one "batch" thread
+            declare -A thread_texts
+            declare -A thread_chats
+            local batch_thread_id=""
+
+            for entry in "${collected[@]}"; do
+                local t_id="${entry%%|*}"
+                local rest="${entry#*|}"
+                local t_chat="${rest%%|*}"
+                local t_text="${rest#*|}"
+
+                # If this is a reply thread, keep its thread ID
+                # If it's a standalone message (own GUID), batch with other standalones
+                local is_reply=false
+                for other in "${collected[@]}"; do
+                    local other_id="${other%%|*}"
+                    if [ "$other_id" != "$t_id" ] && [ "$t_id" = "$other_id" ]; then
+                        is_reply=true
+                        break
+                    fi
+                done
+
+                # Check if this thread_id appears as a THREAD_REPLY_TO (meaning it's part of a reply chain)
+                # Simple heuristic: if multiple messages share the same thread_id, it's a reply thread
+                # If each message has a unique thread_id, they're standalone and should be batched
+                local use_id="$t_id"
+
+                # Count how many entries share this thread_id
+                local count=0
+                for other in "${collected[@]}"; do
+                    local other_id="${other%%|*}"
+                    if [ "$other_id" = "$t_id" ]; then
+                        count=$((count + 1))
+                    fi
+                done
+
+                # If only one message has this thread_id and it looks like a standalone GUID, batch it
+                if [ "$count" -eq 1 ] && [ "$t_id" != "default" ] && [ ${#t_id} -gt 20 ]; then
+                    # Standalone message — use first one's GUID as the batch thread
+                    if [ -z "$batch_thread_id" ]; then
+                        batch_thread_id="$t_id"
+                    fi
+                    use_id="$batch_thread_id"
+                fi
+
+                if [ -n "${thread_texts[$use_id]+x}" ]; then
+                    thread_texts[$use_id]="${thread_texts[$use_id]}
+$t_text"
+                else
+                    thread_texts[$use_id]="$t_text"
+                    thread_chats[$use_id]="$t_chat"
+                fi
+            done
+
+            # Launch one agent per thread group
+            for t_id in "${!thread_texts[@]}"; do
+                if ! is_agent_running "$t_id"; then
+                    "$IMESSAGE_SKILL/typing-indicator.sh" "$CONTACT_PHONE" start > /dev/null 2>&1 || log "  Typing indicator failed, continuing"
+                    start_autonomous_agent "${thread_texts[$t_id]}" "${thread_chats[$t_id]}" "$t_id"
+                else
+                    log "  Agent already running for thread $t_id, skipping"
+                fi
+            done
+
+            unset thread_texts thread_chats
+        fi
     fi
 
     sleep "$CHECK_INTERVAL"
