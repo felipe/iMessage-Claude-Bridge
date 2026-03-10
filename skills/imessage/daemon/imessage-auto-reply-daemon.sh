@@ -9,6 +9,7 @@
 # - IMESSAGE_CONTACT_PHONE: Phone number of the contact to monitor (required)
 # - IMESSAGE_CONTACT_NAME: Display name of the contact (required)
 # - IMESSAGE_CHECK_INTERVAL: How often to check for new messages in seconds (default: 1)
+# - IMESSAGE_DEBOUNCE: Seconds to wait for rapid follow-up messages before launching agent (default: 3)
 #
 
 # Allow running from within a Claude Code session or standalone
@@ -306,7 +307,7 @@ while true; do
 
     if [ -n "$new_messages" ]; then
         # Parse and collect unprocessed messages
-        # Each entry: thread_id|chat|text
+        # Each entry: thread_id|chat|is_reply|text
         collected=()
         while IFS= read -r line; do
             case "$line" in
@@ -319,14 +320,16 @@ while true; do
                     if [ -n "$current_msg_id" ] && [ -n "$current_text" ]; then
                         if ! check_if_processed "$current_msg_id"; then
                             thread_id="default"
+                            msg_is_reply=0
                             if [ -n "$current_thread_reply_to" ]; then
                                 thread_id="$current_thread_reply_to"
+                                msg_is_reply=1
                             elif [ -n "$current_guid" ]; then
                                 thread_id="$current_guid"
                             fi
                             log "New message (thread: $thread_id): \"$current_text\""
                             mark_as_processed "$current_msg_id"
-                            collected+=("${thread_id}|${current_chat:-$CONTACT_PHONE}|${current_text}")
+                            collected+=("${thread_id}|${current_chat:-$CONTACT_PHONE}|${msg_is_reply}|${current_text}")
                         fi
                     fi
                     current_msg_id=""; current_guid=""; current_text=""; current_thread_reply_to=""; current_chat=""
@@ -353,14 +356,16 @@ while true; do
                             if [ -n "$current_msg_id" ] && [ -n "$current_text" ]; then
                                 if ! check_if_processed "$current_msg_id"; then
                                     thread_id="default"
+                                    msg_is_reply=0
                                     if [ -n "$current_thread_reply_to" ]; then
                                         thread_id="$current_thread_reply_to"
+                                        msg_is_reply=1
                                     elif [ -n "$current_guid" ]; then
                                         thread_id="$current_guid"
                                     fi
                                     log "Additional message during debounce (thread: $thread_id): \"$current_text\""
                                     mark_as_processed "$current_msg_id"
-                                    collected+=("${thread_id}|${current_chat:-$CONTACT_PHONE}|${current_text}")
+                                    collected+=("${thread_id}|${current_chat:-$CONTACT_PHONE}|${msg_is_reply}|${current_text}")
                                 fi
                             fi
                             current_msg_id=""; current_guid=""; current_text=""; current_thread_reply_to=""; current_chat=""
@@ -370,71 +375,57 @@ while true; do
             fi
 
             # Group collected messages by thread and launch agents
-            # For non-reply messages (unique GUIDs), merge them under one "batch" thread
-            declare -A thread_texts
-            declare -A thread_chats
-            local batch_thread_id=""
+            # Reply-thread messages keep their own thread ID; standalone messages
+            # (each with a unique GUID) get merged under one "batch" thread.
+            # Uses temp files instead of associative arrays for Bash 3.2 compatibility.
+            batch_dir=$(mktemp -d "$TMP_DIR/batch.XXXXXX")
+            batch_thread_id=""
 
             for entry in "${collected[@]}"; do
-                local t_id="${entry%%|*}"
-                local rest="${entry#*|}"
-                local t_chat="${rest%%|*}"
-                local t_text="${rest#*|}"
+                t_id="${entry%%|*}"
+                rest="${entry#*|}"
+                t_chat="${rest%%|*}"
+                rest="${rest#*|}"
+                t_is_reply="${rest%%|*}"
+                t_text="${rest#*|}"
 
-                # If this is a reply thread, keep its thread ID
-                # If it's a standalone message (own GUID), batch with other standalones
-                local is_reply=false
-                for other in "${collected[@]}"; do
-                    local other_id="${other%%|*}"
-                    if [ "$other_id" != "$t_id" ] && [ "$t_id" = "$other_id" ]; then
-                        is_reply=true
-                        break
-                    fi
-                done
+                use_id="$t_id"
 
-                # Check if this thread_id appears as a THREAD_REPLY_TO (meaning it's part of a reply chain)
-                # Simple heuristic: if multiple messages share the same thread_id, it's a reply thread
-                # If each message has a unique thread_id, they're standalone and should be batched
-                local use_id="$t_id"
-
-                # Count how many entries share this thread_id
-                local count=0
-                for other in "${collected[@]}"; do
-                    local other_id="${other%%|*}"
-                    if [ "$other_id" = "$t_id" ]; then
-                        count=$((count + 1))
-                    fi
-                done
-
-                # If only one message has this thread_id and it looks like a standalone GUID, batch it
-                if [ "$count" -eq 1 ] && [ "$t_id" != "default" ] && [ ${#t_id} -gt 20 ]; then
-                    # Standalone message — use first one's GUID as the batch thread
+                # Reply-thread messages always keep their own thread ID.
+                # Standalone messages (not replies, unique GUID) get batched together.
+                if [ "$t_is_reply" -eq 0 ] && [ "$t_id" != "default" ] && [ ${#t_id} -gt 20 ]; then
                     if [ -z "$batch_thread_id" ]; then
                         batch_thread_id="$t_id"
                     fi
                     use_id="$batch_thread_id"
                 fi
 
-                if [ -n "${thread_texts[$use_id]+x}" ]; then
-                    thread_texts[$use_id]="${thread_texts[$use_id]}
-$t_text"
+                safe_use_id=$(sanitize_thread_id "$use_id")
+                if [ -f "$batch_dir/${safe_use_id}.txt" ]; then
+                    printf '\n%s' "$t_text" >> "$batch_dir/${safe_use_id}.txt"
                 else
-                    thread_texts[$use_id]="$t_text"
-                    thread_chats[$use_id]="$t_chat"
+                    printf '%s' "$t_text" > "$batch_dir/${safe_use_id}.txt"
+                    printf '%s' "$t_chat" > "$batch_dir/${safe_use_id}.chat"
+                    printf '%s' "$use_id" > "$batch_dir/${safe_use_id}.tid"
                 fi
             done
 
             # Launch one agent per thread group
-            for t_id in "${!thread_texts[@]}"; do
+            for txt_file in "$batch_dir"/*.txt; do
+                [ -f "$txt_file" ] || continue
+                safe_use_id="$(basename "$txt_file" .txt)"
+                t_id=$(cat "$batch_dir/${safe_use_id}.tid")
+                t_chat=$(cat "$batch_dir/${safe_use_id}.chat")
+                t_texts=$(cat "$txt_file")
                 if ! is_agent_running "$t_id"; then
                     "$IMESSAGE_SKILL/typing-indicator.sh" "$CONTACT_PHONE" start > /dev/null 2>&1 || log "  Typing indicator failed, continuing"
-                    start_autonomous_agent "${thread_texts[$t_id]}" "${thread_chats[$t_id]}" "$t_id"
+                    start_autonomous_agent "$t_texts" "$t_chat" "$t_id"
                 else
                     log "  Agent already running for thread $t_id, skipping"
                 fi
             done
 
-            unset thread_texts thread_chats
+            rm -rf "$batch_dir"
         fi
     fi
 
